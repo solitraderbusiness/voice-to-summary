@@ -1,0 +1,9 @@
+venv/
+voices/
+*.ogg
+*.wav
+.env
+__pycache__/
+*.pyc
+reports.csv
+reports_backup.sql
