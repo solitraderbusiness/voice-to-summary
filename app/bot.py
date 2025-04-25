@@ -9,6 +9,7 @@ import os
 import uuid
 import asyncio
 import re
+import time
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -17,40 +18,70 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 transcription_lock = asyncio.Lock()
+TELEGRAM_FILE_SIZE_LIMIT = 20 * 1024 * 1024  # 20 MB limit for getFile
 
 def escape_markdown_v2(text):
     """Escape special characters for Telegram MarkdownV2."""
-    special_chars = r'([_\*\[\]()~`>#+\-=|{}.!\\])'  # Include period and backslash
+    special_chars = r'([_\*\[\]()~`>#+\-=|{}.!\\])'
     return re.sub(special_chars, r'\\\1', text)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     logger.info(f"Received /start command from user {user_id}")
-    await update.message.reply_text("لطفاً یک پیام صوتی ارسال کنید تا آن را خلاصه کنم\\!", parse_mode="MarkdownV2")
+    await update.message.reply_text("لطفاً یک پیام صوتی یا فایل صوتی ارسال کنید تا آن را خلاصه کنم\\!", parse_mode="MarkdownV2")
 
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_id = update.message.from_user.id
-        logger.info(f"Received voice message from user {user_id}")
+        logger.info(f"Received message from user {user_id}")
 
-        if not update.message.voice:
-            logger.warning("No voice message found in update")
-            await update.message.reply_text("لطفاً یک **پیام صوتی** ارسال کنید\\.", parse_mode="MarkdownV2")
+        # Check for voice or audio message
+        if update.message.voice:
+            audio_obj = update.message.voice
+            logger.info("Processing voice message")
+        elif update.message.audio:
+            audio_obj = update.message.audio
+            logger.info("Processing audio message")
+        else:
+            logger.warning("No voice or audio message found in update")
+            await update.message.reply_text("لطفاً یک **پیام صوتی یا فایل صوتی** ارسال کنید\\.", parse_mode="MarkdownV2")
             return
 
-        logger.info("Downloading voice file")
-        file = await context.bot.get_file(update.message.voice.file_id)
-        file_path = f"voices/{uuid.uuid4()}.ogg"
-        os.makedirs("voices", exist_ok=True)
-        await file.download_to_drive(file_path)
-        logger.info(f"Voice file saved to {file_path}")
+        # Check file size before attempting download
+        file_size = audio_obj.file_size
+        logger.info(f"Audio file size: {file_size} bytes")
+        if file_size > TELEGRAM_FILE_SIZE_LIMIT:
+            logger.warning(f"File size {file_size} bytes exceeds Telegram limit of {TELEGRAM_FILE_SIZE_LIMIT} bytes")
+            await update.message.reply_text(
+                f"⚠️ فایل صوتی بزرگ‌تر از حد مجاز \\(۲۰ مگابایت\\) است\\. لطفاً فایل را به‌صورت دستی دانلود کرده و مجدداً به‌صورت فایل صوتی کوچک‌تر \\(کمتر از ۲۰ مگابایت\\) ارسال کنید\\.",
+                parse_mode="MarkdownV2"
+            )
+            return
 
+        logger.info("Downloading audio file")
+        file = await context.bot.get_file(audio_obj.file_id)
+        # Determine file extension dynamically
+        file_extension = os.path.splitext(file.file_path)[1] if file.file_path else ".ogg"
+        if not file_extension:
+            file_extension = ".ogg"  # Default to .ogg if unknown
+        file_path = f"voices/{uuid.uuid4()}{file_extension}"
+        os.makedirs("voices", exist_ok=True)
+        try:
+            await file.download_to_drive(file_path)
+            logger.info(f"Audio file saved to {file_path}, size: {os.path.getsize(file_path)} bytes")
+        except Exception as e:
+            logger.error(f"Failed to download audio file: {str(e)}")
+            await update.message.reply_text(f"⚠️ خطا در دانلود فایل صوتی: {escape_markdown_v2(str(e))}", parse_mode="MarkdownV2")
+            return
+
+        start_time = time.time()
         async with transcription_lock:
+            logger.info(f"Acquired lock for user {user_id}, waited {time.time() - start_time:.2f} seconds")
             logger.info("Starting transcription")
             transcript = transcribe_audio(file_path)
             if "error" in transcript.lower():
                 logger.error(f"Transcription failed: {transcript}")
-                await update.message.reply_text(f"⚠️ خطا در پردازش صوت: {escape_markdown_v2(transcript)}", parse_mode="MarkdownV2")
+                await update.message.reply_text(f"⚠️ خطا در پردازش فایل صوتی: {escape_markdown_v2(transcript)}", parse_mode="MarkdownV2")
                 os.remove(file_path)
                 return
             logger.info(f"Transcription successful: {transcript}")
@@ -68,16 +99,15 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report_id = save_report(user_id, file_path, transcript, summary)
         logger.info(f"Saved report with ID {report_id}")
 
-        # Send summary with MarkdownV2, escaping special characters
         escaped_summary = escape_markdown_v2(summary)
         response = f"**خلاصه گزارش**:\n{escaped_summary}"
         await update.message.reply_text(response, parse_mode="MarkdownV2")
-        logger.info(f"Sent summary to user {user_id}")
+        logger.info(f"Sent summary to user {user_id}, total time {time.time() - start_time:.2f} seconds")
 
     except Exception as e:
-        logger.error(f"Error in handle_voice: {str(e)}", exc_info=True)
+        logger.error(f"Error in handle_voice_or_audio: {str(e)}", exc_info=True)
         await update.message.reply_text(f"⚠️ خطا: {escape_markdown_v2(str(e))}", parse_mode="MarkdownV2")
-        if os.path.exists(file_path):
+        if 'file_path' in locals() and os.path.exists(file_path):
             os.remove(file_path)
 
 async def debug_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -88,8 +118,9 @@ def setup_bot():
     try:
         application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         application.add_handler(CommandHandler("start", start))
-        application.add_handler(MessageHandler(filters.VOICE, handle_voice))
-        application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND & ~filters.VOICE, debug_update))
+        # Handle both voice and audio messages
+        application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice_or_audio))
+        application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND & ~(filters.VOICE | filters.AUDIO), debug_update))
         logger.info("Bot setup complete")
         return application
     except Exception as e:
