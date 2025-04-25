@@ -1,7 +1,8 @@
 import logging
 import os
-from pydub import AudioSegment
+import subprocess
 import requests
+import json
 from config.settings import OPENAI_API_KEY
 
 logging.basicConfig(
@@ -20,35 +21,45 @@ def transcribe_audio(file_path):
         file_size = os.path.getsize(file_path)
         logger.info(f"File size: {file_size} bytes")
 
-        # Convert to WAV with optimized settings
-        if file_path.endswith(".ogg"):
-            logger.info("Converting OGG to WAV (16kHz, mono)")
-            audio = AudioSegment.from_ogg(file_path)
-            audio = audio.set_frame_rate(TARGET_SAMPLE_RATE).set_channels(1)
-            wav_path = file_path.replace(".ogg", ".wav")
-            audio.export(wav_path, format="wav")
-            file_path = wav_path
-            file_size = os.path.getsize(file_path)
-            logger.info(f"Converted to {file_path}, size: {file_size} bytes")
+        # Convert to WAV with ffmpeg
+        logger.info(f"Converting audio to WAV (16kHz, mono, PCM)")
+        wav_path = file_path.rsplit(".", 1)[0] + ".wav"
+        try:
+            subprocess.run([
+                "ffmpeg", "-i", file_path, "-ar", str(TARGET_SAMPLE_RATE),
+                "-ac", "1", "-c:a", "pcm_s16le", wav_path, "-y"
+            ], check=True, capture_output=True, text=True)
+            logger.info(f"Converted to {wav_path}, size: {os.path.getsize(wav_path)} bytes")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"FFmpeg conversion error: {e.stderr}")
+            return f"Transcription error: Failed to convert audio format - {e.stderr}"
+        file_path = wav_path
+        file_size = os.path.getsize(file_path)
 
         # Split if file exceeds 20MB
         transcripts = []
         if file_size > MAX_FILE_SIZE:
             logger.info("File exceeds 20MB, splitting into segments")
-            audio = AudioSegment.from_wav(file_path)
-            total_ms = len(audio)
+            audio_duration = get_audio_duration(file_path)
             segment_ms = INITIAL_SEGMENT_MS
+            total_ms = audio_duration * 1000
             segments = []
             start_ms = 0
 
             # Iteratively adjust segment size
             while start_ms < total_ms:
                 end_ms = min(start_ms + segment_ms, total_ms)
-                segment = audio[start_ms:end_ms]
                 segment_path = f"{file_path[:-4]}_segment_{len(segments)}.wav"
-                segment.export(segment_path, format="wav")
-                segment_size = os.path.getsize(segment_path)
-                logger.info(f"Trial segment: {segment_path}, size: {segment_size} bytes")
+                try:
+                    subprocess.run([
+                        "ffmpeg", "-i", file_path, "-ss", str(start_ms / 1000),
+                        "-t", str((end_ms - start_ms) / 1000), segment_path, "-y"
+                    ], check=True, capture_output=True, text=True)
+                    segment_size = os.path.getsize(segment_path)
+                    logger.info(f"Trial segment: {segment_path}, size: {segment_size} bytes")
+                except subprocess.CalledProcessError as e:
+                    logger.error(f"FFmpeg segment error: {e.stderr}")
+                    return f"Transcription error: Failed to split audio - {e.stderr}"
 
                 if segment_size > MAX_FILE_SIZE:
                     logger.info("Segment too large, reducing duration")
@@ -116,3 +127,16 @@ def transcribe_segment(file_path):
     except Exception as e:
         logger.error(f"Segment transcription error: {str(e)}", exc_info=True)
         return f"Transcription error: {str(e)}"
+
+def get_audio_duration(file_path):
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-i", file_path, "-show_entries", "format=duration", "-v", "quiet", "-of", "json"],
+            capture_output=True, text=True, check=True
+        )
+        duration = float(json.loads(result.stdout)["format"]["duration"])
+        logger.info(f"Audio duration: {duration} seconds")
+        return duration
+    except Exception as e:
+        logger.error(f"Failed to get audio duration: {str(e)}")
+        return 600  # Default 10 minutes
